@@ -1,21 +1,21 @@
 [package]
 name = "armature-audit"
 version = "0.2.0"
-edition.workspace = true
-rust-version.workspace = true
-authors.workspace = true
-license.workspace = true
+edition = "2024"
+rust-version = "1.94.1"
+authors = ["Joseph Quinn <quinn.josephr@proton.me>"]
+license = "Apache-2.0"
 repository = "https://github.com/quinnjr/armature-audit"
-homepage.workspace = true
+homepage = "https://quinnjr.github.io/armature"
 description = "Audit logging and compliance for Armature"
 keywords = ["audit", "logging", "compliance", "security"]
 categories = ["web-programming", "development-tools::debugging"]
 
 [dependencies]
-armature-core = { path = "../armature-core", version = "0" }
+armature-core = { version = "0" }
 # Read the VERIFIED principal (UserContext) that JwtAuthMiddleware attaches to
 # request extensions, so the audit trail never trusts an unverified token.
-armature-auth = { path = "../armature-auth", version = "0" }
+armature-auth = { version = "0" }
 tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "fs", "io-util"] }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
