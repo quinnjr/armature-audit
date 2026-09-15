@@ -9,15 +9,13 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
-### Fixed
+## [0.4.0] - 2026-09-15
 
-- **Breaking:** a client-supplied `X-Forwarded-For` is no longer recorded as fact. `trusted_proxy_depth` selects the hop (default: record no IP), and `record_unverified_ip` tags an untrusted value. The same module already refused a forgeable user id for exactly this reason.
-- `FileBackend::read` streams into a bounded ring buffer instead of loading an append-only, unbounded log into memory, and counts corrupt lines over the whole scan rather than the returned window.
+### Changed
 
-### Changed — `0.1.2` → `0.1.3`
-
-- Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
-- The audited method and path are captured as owned strings from the request's new accessors.
+- **Breaking:** requires `armature-auth` 0.4 (was `0.3`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
+- **Breaking:** requires `armature-core` 0.10 (was `0.9`); its types appear in this crate's API, so the requirement change is breaking here and the minor moves. Part of the `armature-core` 0.10 release train.
+- Dependencies bumped to their latest releases: `base64` 0.22 → 0.23, `regex` 1.12 → 1.13, `tokio` 1.52 → 1.53, `uuid` 1.23 → 1.26.
 
 ## [0.3.0] - 2026-08-05
 
