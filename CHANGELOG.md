@@ -9,6 +9,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-17
+
 ### Security
 
 - **Breaking:** `AuditMiddleware` no longer logs request or response bodies by default (`log_request_body`/`log_response_body` now default to `false`). Migration: call `.log_request_body(true)` / `.log_response_body(true)` explicitly if you need them.
