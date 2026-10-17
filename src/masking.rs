@@ -19,6 +19,27 @@ const IDENTITY_FIELDS: &[&str] = &[
     "pin",
 ];
 
+/// Field-name fragments that identify credentials (passwords, tokens, keys).
+/// Any trailing characters of a credential help an attacker (and confirm a
+/// guess), so these — like [`IDENTITY_FIELDS`] — are masked completely
+/// regardless of the configured `show_last_chars`.
+const CREDENTIAL_FIELDS: &[&str] = &[
+    "password",
+    "passwd",
+    "secret",
+    "token",
+    "api_key",
+    "apikey",
+    "api-key",
+    "bearer",
+    "authorization",
+    "auth",
+    "private_key",
+    "privatekey",
+    "cookie",
+    "session",
+];
+
 /// Fields to mask by default
 pub const DEFAULT_MASKED_FIELDS: &[&str] = &[
     "password",
@@ -42,6 +63,8 @@ pub const DEFAULT_MASKED_FIELDS: &[&str] = &[
     "pin",
     "private_key",
     "privatekey",
+    "cookie",
+    "session",
 ];
 
 /// Regular expressions for masking patterns
@@ -82,7 +105,12 @@ pub struct MaskingConfig {
     /// Mask character (default: '*')
     pub mask_char: char,
 
-    /// Show last N characters
+    /// Show last N characters of a masked value.
+    ///
+    /// Defaults to `0`. Never applied to credential fields (passwords, tokens,
+    /// keys, …) or identity fields (SSN, card, …), which are always masked
+    /// completely; it only affects custom fields added with
+    /// [`MaskingConfig::add_field`].
     pub show_last_chars: usize,
 }
 
@@ -98,7 +126,7 @@ impl Default for MaskingConfig {
             mask_ssn: true,
             mask_credit_cards: true,
             mask_char: '*',
-            show_last_chars: 4,
+            show_last_chars: 0,
         }
     }
 }
@@ -263,7 +291,7 @@ fn mask_json_inner(value: &Value, config: &MaskingConfig, matchers: &[String]) -
                         // zero trailing characters — the last four digits are
                         // exactly what an attacker wants — regardless of the
                         // configured `show_last_chars`.
-                        let show_last = if is_identity_field(&key_lower) {
+                        let show_last = if is_fully_masked_field(&key_lower) {
                             0
                         } else {
                             config.show_last_chars
@@ -293,23 +321,167 @@ fn mask_json_inner(value: &Value, config: &MaskingConfig, matchers: &[String]) -
     }
 }
 
-/// Whether a (lowercased) field name denotes a high-sensitivity identifier
-/// whose trailing characters must never be revealed.
-fn is_identity_field(key_lower: &str) -> bool {
+/// Whether a (lowercased) field name denotes a credential or high-sensitivity
+/// identifier whose trailing characters must never be revealed.
+fn is_fully_masked_field(key_lower: &str) -> bool {
     IDENTITY_FIELDS
         .iter()
+        .chain(CREDENTIAL_FIELDS)
         .any(|field| key_lower.contains(field))
 }
 
-/// Mask sensitive data in text body
+/// Whether a (lowercased) key matches one of the configured masked fields.
+fn is_masked_key(key_lower: &str, matchers: &[String]) -> bool {
+    matchers
+        .iter()
+        .any(|field| key_lower.contains(field.as_str()))
+}
+
+/// Placeholder written in place of a body that looked structured but could
+/// not be parsed, so key-based masking was impossible.
+pub const UNPARSEABLE_BODY_PLACEHOLDER: &str = "[REDACTED: unparseable structured body]";
+
+/// Mask sensitive data in a text body.
+///
+/// - **JSON** is parsed and masked by key ([`mask_json`]).
+/// - A body that *looks* like JSON (starts with `{` or `[`) but does not
+///   parse is replaced entirely with [`UNPARSEABLE_BODY_PLACEHOLDER`]: its
+///   keys cannot be trusted to be found by pattern matching.
+/// - **`application/x-www-form-urlencoded`**-shaped bodies (`a=1&b=2`) are
+///   masked by key ([`mask_form`]).
+/// - Anything else gets `key: value` / `key=value` masking for the configured
+///   fields, then the PII patterns ([`mask_string`]).
+///
+/// # Examples
+///
+/// ```
+/// use armature_audit::*;
+///
+/// let config = MaskingConfig::default();
+/// let masked = mask_body("user=alice&password=hunter2", &config);
+/// assert!(!masked.contains("hunter2"));
+/// assert!(masked.contains("user=alice"));
+/// ```
 pub fn mask_body(body: &str, config: &MaskingConfig) -> String {
-    // Try to parse as JSON first
-    if let Ok(json) = serde_json::from_str::<Value>(body) {
-        let masked = mask_json(&json, config);
-        serde_json::to_string(&masked).unwrap_or_else(|_| body.to_string())
-    } else {
-        // Fall back to string masking
-        mask_string(body, config)
+    let trimmed = body.trim_start();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        return match serde_json::from_str::<Value>(body) {
+            Ok(json) => {
+                let masked = mask_json(&json, config);
+                serde_json::to_string(&masked)
+                    .unwrap_or_else(|_| UNPARSEABLE_BODY_PLACEHOLDER.to_string())
+            }
+            Err(_) => UNPARSEABLE_BODY_PLACEHOLDER.to_string(),
+        };
+    }
+
+    if looks_form_encoded(body) {
+        return mask_form(body, config);
+    }
+
+    mask_string(&mask_key_values(body, config), config)
+}
+
+/// Heuristic: a non-empty body with no whitespace whose every `&`-separated
+/// pair contains `=`.
+fn looks_form_encoded(body: &str) -> bool {
+    !body.is_empty()
+        && !body.contains(char::is_whitespace)
+        && body
+            .split('&')
+            .all(|pair| pair.is_empty() || pair.contains('='))
+        && body.contains('=')
+}
+
+/// Mask an `application/x-www-form-urlencoded` body by key.
+///
+/// The value of every pair whose (percent-decoded, lowercased) key matches a
+/// configured masked field is replaced with `[REDACTED]`; other values are
+/// percent-decoded and run through the PII patterns, and replaced only if a
+/// pattern matched.
+///
+/// # Examples
+///
+/// ```
+/// use armature_audit::*;
+///
+/// let masked = mask_form("user=alice&api_key=sk_live_1", &MaskingConfig::default());
+/// assert_eq!(masked, "user=alice&api_key=[REDACTED]");
+/// ```
+pub fn mask_form(body: &str, config: &MaskingConfig) -> String {
+    let matchers: Vec<String> = config
+        .masked_fields
+        .iter()
+        .map(|f| f.to_lowercase())
+        .collect();
+
+    body.split('&')
+        .map(|pair| {
+            let Some((key, value)) = pair.split_once('=') else {
+                return pair.to_string();
+            };
+            let key_lower = percent_decode(key).to_lowercase();
+            if is_masked_key(&key_lower, &matchers) {
+                return format!("{key}=[REDACTED]");
+            }
+            let decoded = percent_decode(value);
+            let masked = mask_string(&decoded, config);
+            if masked == decoded {
+                pair.to_string()
+            } else {
+                format!("{key}={masked}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Lossy `application/x-www-form-urlencoded` decoding (`+` → space, `%XX`).
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                match hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    Some(b) => {
+                        out.push(b);
+                        i += 2;
+                    }
+                    None => out.push(b'%'),
+                }
+            }
+            b => out.push(b),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Redact the value in `key: value` / `key=value` occurrences of a configured
+/// masked field inside free text (e.g. `password: hunter2`,
+/// `Authorization: Bearer abc`).
+fn mask_key_values(input: &str, config: &MaskingConfig) -> String {
+    let alternation = config
+        .masked_fields
+        .iter()
+        .map(|f| regex::escape(f))
+        .collect::<Vec<_>>()
+        .join("|");
+    if alternation.is_empty() {
+        return input.to_string();
+    }
+    let pattern = format!(
+        r#"(?i)([\w-]*(?:{alternation})[\w-]*"?\s*[:=]\s*)(?:(?:bearer|basic)\s+)?("[^"]*"|[^\s,;&]+)"#
+    );
+    match Regex::new(&pattern) {
+        Ok(re) => re.replace_all(input, "${1}[REDACTED]").into_owned(),
+        // A field list that does not compile cannot be honoured; do not
+        // return the input unmasked.
+        Err(_) => UNPARSEABLE_BODY_PLACEHOLDER.to_string(),
     }
 }
 
@@ -460,14 +632,61 @@ mod tests {
     }
 
     #[test]
-    fn test_mask_json_nonidentity_field_keeps_last_chars() {
-        // Non-identity secret fields still reveal the configured tail.
-        let config = MaskingConfig::default();
-        let data = json!({ "password": "secret123" });
+    fn test_mask_json_credentials_never_reveal_tail() {
+        // Credentials reveal nothing, even with a non-zero show_last_chars.
+        let config = MaskingConfig::default().show_last_chars(4);
+        let data = json!({ "password": "secret123", "access_token": "tok_abcd" });
         let masked = mask_json(&data, &config);
         let pw = masked["password"].as_str().unwrap();
-        assert!(pw.ends_with("123"), "password tail preserved: {pw}");
-        assert!(pw.starts_with('*'));
+        assert!(pw.chars().all(|c| c == '*'), "password fully masked: {pw}");
+        let tok = masked["access_token"].as_str().unwrap();
+        assert!(tok.chars().all(|c| c == '*'), "token fully masked: {tok}");
+    }
+
+    #[test]
+    fn test_custom_field_keeps_configured_tail() {
+        let config = MaskingConfig::default()
+            .add_field("account_number")
+            .show_last_chars(2);
+        let masked = mask_json(&json!({ "account_number": "12345678" }), &config);
+        assert_eq!(masked["account_number"], "******78");
+    }
+
+    #[test]
+    fn test_default_show_last_chars_is_zero() {
+        assert_eq!(MaskingConfig::default().show_last_chars, 0);
+    }
+
+    #[test]
+    fn test_mask_body_form_encoded() {
+        let config = MaskingConfig::default();
+        let masked = mask_body(
+            "username=alice&password=hunter2&refresh%5Ftoken=rt_123&email=a%40b.com",
+            &config,
+        );
+        assert!(masked.contains("username=alice"), "{masked}");
+        assert!(!masked.contains("hunter2"), "{masked}");
+        assert!(!masked.contains("rt_123"), "{masked}");
+        assert!(masked.contains("email=[EMAIL]"), "{masked}");
+    }
+
+    #[test]
+    fn test_mask_body_unparseable_json_is_redacted() {
+        let config = MaskingConfig::default();
+        let masked = mask_body(r#"{"password":"hunter2","x":"#, &config);
+        assert_eq!(masked, UNPARSEABLE_BODY_PLACEHOLDER);
+    }
+
+    #[test]
+    fn test_mask_body_text_key_values() {
+        let config = MaskingConfig::default();
+        let masked = mask_body(
+            "login password: hunter2 Authorization: Bearer abc.def.ghi user=bob",
+            &config,
+        );
+        assert!(!masked.contains("hunter2"), "{masked}");
+        assert!(!masked.contains("abc.def.ghi"), "{masked}");
+        assert!(masked.contains("user=bob"), "{masked}");
     }
 
     #[test]

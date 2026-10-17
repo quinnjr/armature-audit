@@ -34,20 +34,15 @@ pub struct AuditMiddleware {
     /// Number of reverse proxies in front of the app that are trusted to have
     /// appended to `X-Forwarded-For`.
     ///
-    /// **Default: `0` (safe)** — no proxy is trusted, so forwarding headers are
-    /// ignored and no client address is recorded. `X-Forwarded-For` is written
-    /// by the client on the way in; each proxy *appends* the peer it saw, so
-    /// only the rightmost `trusted_proxy_depth` entries were added by
-    /// infrastructure you control. Taking the leftmost hop, as this middleware
-    /// previously did, let any caller write an arbitrary address into a
-    /// non-repudiation record — the same forgery this module already refuses to
-    /// accept for the principal. Mirrors
-    /// `RateLimitMiddleware::trusted_proxy_depth` (armature-ratelimit).
+    /// **Default: `0` (safe)** — no proxy is trusted, forwarding headers are
+    /// ignored, and the address recorded is the socket peer the connection
+    /// actually arrived from. Resolution is delegated to
+    /// [`HttpRequest::client_address`], which reads the `trusted_proxy_depth`-th
+    /// entry from the *right* across every `X-Forwarded-For` field line: each
+    /// proxy appends the peer it saw, so only those trailing entries were
+    /// written by infrastructure you control. `X-Real-IP` is never consulted.
+    /// The same rule is used by `armature-ratelimit`.
     trusted_proxy_depth: usize,
-    /// Whether to record the client-supplied address anyway when no proxy is
-    /// trusted, prefixed with `unverified:` so nothing downstream mistakes it
-    /// for an attested value. Default `false`.
-    record_unverified_ip: bool,
     /// When an audit-write fails: `false` (default) fails open — the request
     /// still completes normally and the failure is only observable via
     /// [`AuditMiddleware::write_failure_count`] and a `tracing::error!` line.
@@ -87,13 +82,12 @@ impl AuditMiddleware {
     pub fn new(logger: Arc<AuditLogger>) -> Self {
         Self {
             logger,
-            log_request_body: true,
-            log_response_body: true,
+            log_request_body: false,
+            log_response_body: false,
             max_body_size: 10_000, // 10KB default
             subject_claim: "sub".to_string(),
             trust_unverified_jwt_subject: false,
             trusted_proxy_depth: 0,
-            record_unverified_ip: false,
             fail_on_error: false,
             write_failures: AtomicU64::new(0),
         }
@@ -120,33 +114,32 @@ impl AuditMiddleware {
     /// Set how many reverse proxies in front of the app are trusted to have
     /// appended to `X-Forwarded-For`.
     ///
-    /// Defaults to `0` (forwarding headers ignored). Set it to the number of
-    /// proxies that actually sit in front of this service — with one trusted
-    /// proxy, the rightmost hop is the address that proxy observed. See
-    /// [`AuditMiddleware::trusted_proxy_depth`] (the field docs).
+    /// Defaults to `0`: forwarding headers are ignored and the socket peer is
+    /// recorded. Set it to the number of proxies that actually sit in front of
+    /// this service — with one trusted proxy, the rightmost hop is the address
+    /// that proxy observed. A chain shorter than the configured depth records
+    /// no address rather than a client-chosen one.
     pub fn trusted_proxy_depth(mut self, depth: usize) -> Self {
         self.trusted_proxy_depth = depth;
         self
     }
 
-    /// Record the client-supplied address even when no proxy is trusted,
-    /// prefixed with `unverified:`.
+    /// Set whether to log request bodies.
     ///
-    /// Useful when the address has troubleshooting value and the record must
-    /// not imply it was attested. It remains fully attacker-controlled; prefer
-    /// configuring [`Self::trusted_proxy_depth`] instead.
-    pub fn record_unverified_ip(mut self, record: bool) -> Self {
-        self.record_unverified_ip = record;
-        self
-    }
-
-    /// Set whether to log request bodies
+    /// **Default: `false`.** Request bodies routinely carry credentials,
+    /// tokens and personal data. When enabled, the body is masked with the
+    /// logger's [`MaskingConfig`](crate::MaskingConfig) *before* it is
+    /// truncated to [`Self::max_body_size`], so a large JSON or form body is
+    /// still masked by key rather than falling back to pattern-only masking.
     pub fn log_request_body(mut self, log: bool) -> Self {
         self.log_request_body = log;
         self
     }
 
-    /// Set whether to log response bodies
+    /// Set whether to log response bodies.
+    ///
+    /// **Default: `false`.** See [`Self::log_request_body`] for how enabled
+    /// bodies are masked.
     pub fn log_response_body(mut self, log: bool) -> Self {
         self.log_response_body = log;
         self
@@ -346,54 +339,14 @@ impl AuditMiddleware {
     /// Extract the client address to record, or `None` when nothing
     /// trustworthy is available.
     ///
-    /// The address is selected `trusted_proxy_depth`-from-the-right of
-    /// `X-Forwarded-For`, because each trusted proxy appends the peer it saw
-    /// and only those trailing entries are attested. With the default depth of
-    /// `0` nothing in the forwarding headers is trusted and `None` is returned
-    /// (or an explicitly `unverified:`-tagged value, if
-    /// [`Self::record_unverified_ip`] is on) — an audit record is a
-    /// non-repudiation artefact, and a caller-chosen address in it is worse
-    /// than no address at all.
+    /// Delegates to [`HttpRequest::client_address`]: at depth `0` this is the
+    /// socket peer; otherwise the `trusted_proxy_depth`-th `X-Forwarded-For`
+    /// hop from the right. An audit record is a non-repudiation artefact, so a
+    /// caller-chosen address (leftmost hop, `X-Real-IP`) is never recorded.
     fn extract_ip(&self, request: &HttpRequest) -> Option<String> {
-        if self.trusted_proxy_depth == 0 {
-            if !self.record_unverified_ip {
-                return None;
-            }
-
-            let claimed = request
-                .headers
-                .get("x-forwarded-for")
-                .and_then(|xff| xff.split(',').next())
-                .or_else(|| request.headers.get("x-real-ip"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())?;
-
-            return Some(format!("unverified:{claimed}"));
-        }
-
-        if let Some(forwarded) = request.headers.get("x-forwarded-for") {
-            let hops: Vec<&str> = forwarded
-                .split(',')
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .collect();
-            // Out-of-range depth attests nothing: fall through rather than
-            // reaching into hops the client could have written.
-            if let Some(idx) = hops.len().checked_sub(self.trusted_proxy_depth)
-                && let Some(hop) = hops.get(idx)
-            {
-                return Some((*hop).to_string());
-            }
-        }
-
-        // `X-Real-IP` carries a single value set by the nearest proxy, so it is
-        // meaningful exactly when a proxy is trusted.
         request
-            .headers
-            .get("x-real-ip")
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
+            .client_address(self.trusted_proxy_depth)
+            .map(|ip| ip.to_string())
     }
 
     /// Extract user agent from request
@@ -401,19 +354,30 @@ impl AuditMiddleware {
         request.headers.get("user-agent").map(str::to_owned)
     }
 
-    /// Truncate body if too large
+    /// Mask a body with the logger's masking configuration, then truncate it.
+    ///
+    /// Masking runs on the **whole** body first: truncating first would cut a
+    /// JSON or form document mid-structure, the parse would fail, and masking
+    /// would degrade to pattern-only matching that leaves keyed secrets
+    /// (`"password": "…"`) in the clear.
     fn truncate_body(&self, body: &[u8]) -> Option<String> {
         if body.is_empty() {
             return None;
         }
 
-        if body.len() > self.max_body_size {
-            let truncated = &body[..self.max_body_size];
-            let mut text = String::from_utf8_lossy(truncated).to_string();
+        let masked = crate::mask_body(&String::from_utf8_lossy(body), self.logger.masking_config());
+
+        if masked.len() > self.max_body_size {
+            // Cut on a char boundary at or below the limit.
+            let mut end = self.max_body_size;
+            while !masked.is_char_boundary(end) {
+                end -= 1;
+            }
+            let mut text = masked[..end].to_string();
             text.push_str("... [TRUNCATED]");
             Some(text)
         } else {
-            Some(String::from_utf8_lossy(body).to_string())
+            Some(masked)
         }
     }
 }
@@ -429,7 +393,9 @@ impl Middleware for AuditMiddleware {
 
         // Extract request information
         let method = request.method_str().to_owned();
-        let path = request.path_str().to_owned();
+        // Path only: query strings carry tokens, reset codes and personal data,
+        // and this value is forwarded verbatim to SIEMs (`SiemEvent.url`).
+        let path = request.path_only().to_owned();
         let user_id = self.extract_user_id(&request);
         let ip_address = self.extract_ip(&request);
         let user_agent = self.extract_user_agent(&request);
@@ -593,14 +559,30 @@ mod tests {
         AuditMiddleware::new(logger)
     }
 
+    fn peer() -> Option<std::net::SocketAddr> {
+        Some(std::net::SocketAddr::from(([192, 0, 2, 50], 40000)))
+    }
+
     #[test]
     fn test_forged_xff_is_not_recorded_by_default() {
         // An audit record is a non-repudiation artefact; letting the client
         // choose the address written into it defeats that. With no trusted
-        // proxy configured the header is not evidence of anything.
+        // proxy configured the header is ignored and the socket peer recorded.
         let middleware = test_middleware();
-        assert_eq!(middleware.extract_ip(&request_with_xff("1.2.3.4")), None);
+        let request = request_with_xff("1.2.3.4").with_peer(peer());
+        assert_eq!(middleware.extract_ip(&request), Some("192.0.2.50".into()));
 
+        let mut request = HttpRequest::new("GET", "/api/test".to_string()).with_peer(peer());
+        request.headers.insert("x-real-ip", "1.2.3.4");
+        assert_eq!(middleware.extract_ip(&request), Some("192.0.2.50".into()));
+
+        // No socket peer and no trusted proxy: nothing attested, nothing recorded.
+        assert_eq!(middleware.extract_ip(&request_with_xff("1.2.3.4")), None);
+    }
+
+    #[test]
+    fn test_x_real_ip_is_never_trusted() {
+        let middleware = test_middleware().trusted_proxy_depth(1);
         let mut request = HttpRequest::new("GET", "/api/test".to_string());
         request.headers.insert("x-real-ip", "1.2.3.4");
         assert_eq!(middleware.extract_ip(&request), None);
@@ -630,21 +612,24 @@ mod tests {
     }
 
     #[test]
-    fn test_unverified_ip_is_tagged_when_opted_in() {
-        let middleware = test_middleware().record_unverified_ip(true);
-        assert_eq!(
-            middleware.extract_ip(&request_with_xff("203.0.113.9, 10.0.0.1")),
-            Some("unverified:203.0.113.9".to_string())
-        );
+    fn test_xff_hop_counts_every_field_line() {
+        // A proxy that appends its own field line instead of extending the
+        // client's: the attested hop lives on the second line.
+        let middleware = test_middleware().trusted_proxy_depth(1);
+        let mut request = HttpRequest::new("GET", "/api/test".to_string());
+        request.headers.append("x-forwarded-for", "6.6.6.6");
+        request.headers.append("x-forwarded-for", "203.0.113.7");
+        assert_eq!(middleware.extract_ip(&request), Some("203.0.113.7".into()));
     }
 
     #[test]
     fn test_audit_middleware_creation() {
         let logger = Arc::new(AuditLogger::builder().backend(MemoryBackend::new()).build());
 
+        // Bodies routinely carry credentials: logging them is opt-in.
         let middleware = AuditMiddleware::new(logger);
-        assert!(middleware.log_request_body);
-        assert!(middleware.log_response_body);
+        assert!(!middleware.log_request_body);
+        assert!(!middleware.log_response_body);
     }
 
     #[test]
@@ -652,12 +637,12 @@ mod tests {
         let logger = Arc::new(AuditLogger::builder().backend(MemoryBackend::new()).build());
 
         let middleware = AuditMiddleware::new(logger)
-            .log_request_body(false)
-            .log_response_body(false)
+            .log_request_body(true)
+            .log_response_body(true)
             .max_body_size(5000);
 
-        assert!(!middleware.log_request_body);
-        assert!(!middleware.log_response_body);
+        assert!(middleware.log_request_body);
+        assert!(middleware.log_response_body);
         assert_eq!(middleware.max_body_size, 5000);
     }
 
@@ -800,6 +785,66 @@ mod tests {
 
         assert!(truncated.len() <= 30); // 10 + "... [TRUNCATED]"
         assert!(truncated.contains("[TRUNCATED]"));
+    }
+
+    #[test]
+    fn test_large_json_body_is_masked_before_truncation() {
+        let logger = Arc::new(AuditLogger::builder().backend(MemoryBackend::new()).build());
+        let middleware = AuditMiddleware::new(logger).max_body_size(64);
+
+        // The secret sits inside the kept prefix, but the document is far
+        // larger than the cap: truncating first would break the JSON parse and
+        // leave the password to pattern-only masking (which misses it).
+        let body = format!(
+            r#"{{"password":"hunter2-supersecret","padding":"{}"}}"#,
+            "x".repeat(20_000)
+        );
+        let logged = middleware.truncate_body(body.as_bytes()).unwrap();
+        assert!(!logged.contains("hunter2"), "secret leaked: {logged}");
+        assert!(logged.contains("[TRUNCATED]"));
+    }
+
+    #[test]
+    fn test_form_body_is_masked_by_key() {
+        let logger = Arc::new(AuditLogger::builder().backend(MemoryBackend::new()).build());
+        let middleware = AuditMiddleware::new(logger);
+        let logged = middleware
+            .truncate_body(b"username=alice&password=hunter2&api_key=sk_live_abcdef")
+            .unwrap();
+        assert!(logged.contains("username=alice"), "{logged}");
+        assert!(!logged.contains("hunter2"), "{logged}");
+        assert!(!logged.contains("abcdef"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn test_query_string_is_not_recorded() {
+        struct Shared(Arc<MemoryBackend>);
+        #[async_trait::async_trait]
+        impl AuditBackend for Shared {
+            async fn write(&self, event: &AuditEvent) -> Result<(), AuditBackendError> {
+                self.0.write(event).await
+            }
+            async fn flush(&self) -> Result<(), AuditBackendError> {
+                Ok(())
+            }
+        }
+        let backend = Arc::new(MemoryBackend::new());
+        let logger = Arc::new(
+            AuditLogger::builder()
+                .backend(Shared(backend.clone()))
+                .build(),
+        );
+        let middleware = AuditMiddleware::new(logger);
+        let request = HttpRequest::new("GET", "/reset?token=s3cr3t&email=a@b.c".to_string());
+        middleware
+            .handle(
+                request,
+                Box::new(|_req| Box::pin(async move { Ok(HttpResponse::ok()) })),
+            )
+            .await
+            .unwrap();
+        let events = backend.read(10).await.unwrap();
+        assert_eq!(events[0].path.as_deref(), Some("/reset"));
     }
 
     /// Default config (`fail_on_error == false`): a failing backend must not
