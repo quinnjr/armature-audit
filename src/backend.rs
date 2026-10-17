@@ -48,6 +48,20 @@ pub enum AuditBackendError {
     Other(String),
 }
 
+/// `OpenOptions` that create files readable and writable by the owner only
+/// (`0o600` on Unix).
+///
+/// Audit records hold principals, client addresses and (when enabled)
+/// request bodies; the process umask commonly yields `0o644`, which would let
+/// every local user read them. The mode only applies when the file is
+/// created; an existing file keeps its permissions.
+fn owner_only_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    #[cfg(unix)]
+    options.mode(0o600);
+    options
+}
+
 /// File-based audit backend
 ///
 /// Writes audit events to a file, one JSON object per line.
@@ -100,7 +114,7 @@ impl AuditBackend for FileBackend {
 
         let mut guard = self.writer.lock().await;
         if guard.is_none() {
-            let file = OpenOptions::new()
+            let file = owner_only_options()
                 .create(true)
                 .append(true)
                 .open(&self.path)
@@ -235,7 +249,14 @@ impl AuditBackend for FileBackend {
         if !kept.is_empty() {
             new_content.push('\n');
         }
-        tokio::fs::write(&self.path, new_content).await?;
+        let mut file = owner_only_options()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)
+            .await?;
+        file.write_all(new_content.as_bytes()).await?;
+        file.flush().await?;
 
         Ok(deleted)
     }
@@ -380,6 +401,20 @@ impl AuditBackend for MultiBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_file_backend_creates_owner_only_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.log");
+        let backend = FileBackend::new(&path);
+        backend.write(&AuditEvent::new("test.event")).await.unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "audit log must not be group/world readable");
+    }
 
     #[tokio::test]
     async fn test_memory_backend() {

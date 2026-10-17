@@ -9,6 +9,20 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Security
+
+- **Breaking:** `AuditMiddleware` no longer logs request or response bodies by default (`log_request_body`/`log_response_body` now default to `false`). Migration: call `.log_request_body(true)` / `.log_response_body(true)` explicitly if you need them.
+- Enabled bodies are masked with the logger's `MaskingConfig` *before* truncation to `max_body_size`, so a large JSON body no longer falls back to pattern-only masking that left keyed secrets in the clear.
+- `mask_body` masks `application/x-www-form-urlencoded` bodies by key (new `mask_form`), redacts `key: value` / `key=value` occurrences of masked fields in free text (including `Authorization: Bearer …`), and replaces a body that looks like JSON but does not parse with `UNPARSEABLE_BODY_PLACEHOLDER`.
+- **Breaking:** `MaskingConfig::show_last_chars` defaults to `0` (was `4`), and credential fields (password, secret, token, API key, authorization, cookie, session, private key) are always masked completely regardless of it. `cookie` and `session` were added to `DEFAULT_MASKED_FIELDS`.
+- `FileBackend` creates audit files with mode `0o600` on Unix (the retention rewrite too) instead of inheriting the umask.
+- The audit event's `path` (forwarded to SIEMs as `SiemEvent.url`) is now the path only; the query string, which commonly carries tokens and personal data, is no longer recorded.
+- **Breaking:** the client address is resolved with `HttpRequest::client_address(trusted_proxy_depth)`: the socket peer at the default depth `0`, otherwise the depth-th `X-Forwarded-For` hop from the right across every field line. `X-Real-IP` is never consulted. `AuditMiddleware::record_unverified_ip` is removed. Migration: delete the call; configure `trusted_proxy_depth` to match your proxies.
+
+### Added
+
+- `AuditLogger::masking_config()` accessor.
+
 ## [0.4.0] - 2026-09-15
 
 ### Changed
