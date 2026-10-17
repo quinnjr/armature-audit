@@ -67,6 +67,11 @@ impl AuditLogger {
         self.backend.write(&event).await
     }
 
+    /// The masking configuration applied to every event this logger writes.
+    pub fn masking_config(&self) -> &MaskingConfig {
+        &self.masking_config
+    }
+
     /// Flush any pending writes
     pub async fn flush(&self) -> Result<(), crate::backend::AuditBackendError> {
         self.backend.flush().await
